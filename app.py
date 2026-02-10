@@ -1,5 +1,4 @@
 import os
-import json
 import requests
 from flask import Flask, request
 
@@ -13,26 +12,21 @@ DIFY_BASE_URL = os.getenv("DIFY_BASE_URL", "https://api.dify.ai")
 if not LINE_TOKEN or not DIFY_API_KEY:
     app.logger.warning("Missing env vars: LINE_CHANNEL_ACCESS_TOKEN or DIFY_API_KEY")
 
-# ===== ユーザーごとの会話ID（簡易メモリ）=====
-# ※ Render再起動で消えるが、今回はOK
-USER_CONVERSATIONS = {}
 
-
-# ===== Dify 呼び出し（streaming / SSE）=====
 def call_dify(user_text: str, user_id: str) -> str:
+    """
+    Difyへ問い合わせて answer を返す（blockingモード）
+    400/401などのときは本文をログに出して原因特定できるようにする
+    """
     url = f"{DIFY_BASE_URL}/v1/chat-messages"
     headers = {
         "Authorization": f"Bearer {DIFY_API_KEY}",
         "Content-Type": "application/json",
     }
-
-    conversation_id = USER_CONVERSATIONS.get(user_id, "")
-
     payload = {
         "inputs": {},
         "query": user_text,
-        "response_mode": "streaming",  # ★重要
-        "conversation_id": conversation_id,
+        "response_mode": "blocking",  # ★まずは最も単純なblockingで安定させる
         "user": f"line:{user_id}",
         "files": [],
         "auto_generate_name": True,
@@ -40,59 +34,23 @@ def call_dify(user_text: str, user_id: str) -> str:
 
     app.logger.info(f"Dify request URL: {url}")
 
-    r = requests.post(
-        url,
-        headers=headers,
-        json=payload,
-        stream=True,
-        timeout=60,
-    )
+    r = requests.post(url, headers=headers, json=payload, timeout=60)
 
-    # 400/401 などはここで捕まえる
+    # ★失敗時は必ず本文をログに出す（ここが原因特定の決め手）
     if r.status_code >= 400:
-        app.logger.error(f"Dify error {r.status_code}: {r.text}")
+        app.logger.error(f"Dify error {r.status_code} headers: {dict(r.headers)}")
+        app.logger.error(f"Dify error {r.status_code} body: {r.text}")
         r.raise_for_status()
 
-    answer_parts = []
-
-    # SSE（data: {...}）を読む
-    for raw_line in r.iter_lines(decode_unicode=True):
-        if not raw_line:
-            continue
-
-        line = raw_line.strip()
-        if not line.startswith("data:"):
-            continue
-
-        data_str = line[len("data:"):].strip()
-
-        if data_str == "[DONE]":
-            break
-
-        try:
-            obj = json.loads(data_str)
-        except Exception:
-            continue
-
-        # 会話IDを保存
-        cid = obj.get("conversation_id")
-        if cid:
-            USER_CONVERSATIONS[user_id] = cid
-
-        # 回答本文
-        if isinstance(obj.get("answer"), str):
-            answer_parts.append(obj["answer"])
-
-        # 終了イベント
-        if obj.get("event") in ("message_end", "message_end_event"):
-            break
-
-    answer = "".join(answer_parts).strip()
-    return answer or "（返答が取得できませんでした。もう一度送ってください。）"
+    data = r.json()
+    answer = data.get("answer")
+    return answer or "（Difyの返答が空でした）もう一度送ってください。"
 
 
-# ===== LINE 返信 =====
 def reply_line(reply_token: str, text: str) -> None:
+    """
+    LINEへ返信する
+    """
     url = "https://api.line.me/v2/bot/message/reply"
     headers = {
         "Authorization": f"Bearer {LINE_TOKEN}",
@@ -104,16 +62,16 @@ def reply_line(reply_token: str, text: str) -> None:
     }
 
     r = requests.post(url, headers=headers, json=payload, timeout=30)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        app.logger.error(f"LINE reply error {r.status_code} body: {r.text}")
+        r.raise_for_status()
 
 
-# ===== ヘルスチェック =====
 @app.get("/")
 def health():
     return "ok", 200
 
 
-# ===== Webhook =====
 @app.post("/webhook")
 def webhook():
     body = request.get_json(silent=True)
@@ -150,6 +108,6 @@ def webhook():
     return "OK", 200
 
 
-# ===== ローカル実行用（Renderでは使われない）=====
 if __name__ == "__main__":
+    # ローカル確認用（Render本番は gunicorn app:app で起動される）
     app.run(host="0.0.0.0", port=8000, debug=True)
